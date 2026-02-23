@@ -162,7 +162,7 @@ class PanoProcessor:
         self._pano_size = None
         self._rays_in_cam = None
 
-    def process(self, pano_name: str):
+    def process(self, pano_name: str, pano_idx: int):
         pano_path = self.pano_image_dir / pano_name
         try:
             pano_image = PIL.Image.open(pano_path)
@@ -224,8 +224,15 @@ class PanoProcessor:
                 .transpose()
             )
 
+            pano_path_obj = Path(pano_name)
+            folder_name = pano_path_obj.parent.name
+            if not folder_name or folder_name == ".":
+                folder_name = self.pano_image_dir.name
+            unique_name = (
+                f"{folder_name}_{pano_idx:05d}_{pano_path_obj.name}"
+            )
             image_name = (
-                self.rig_config.cameras[cam_idx].image_prefix + pano_name
+                self.rig_config.cameras[cam_idx].image_prefix + unique_name
             )
             mask_name = f"{image_name}.png"
 
@@ -256,8 +263,8 @@ def render_perspective_images(
     with tqdm(total=num_panos) as pbar:
         with ThreadPoolExecutor(max_workers=max_workers) as thread_pool:
             futures = [
-                thread_pool.submit(processor.process, pano_name)
-                for pano_name in pano_image_names
+                thread_pool.submit(processor.process, pano_name, idx)
+                for idx, pano_name in enumerate(pano_image_names)
             ]
             for future in as_completed(futures):
                 future.result()
