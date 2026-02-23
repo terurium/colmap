@@ -7,6 +7,8 @@ compile_commands.json
 
 # Custom directories
 .idea/
+python/examples/output/
+python/myscripts/output/
 .vscode
 .vs
 .DS_Store
