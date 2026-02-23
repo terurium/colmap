@@ -1,8 +1,10 @@
 """
-An example for running incremental SfM on 360 spherical panorama images.
+panorama_sfm.pyベースの画像切り出し専用スクリプト
+特徴抽出の前で処理を停止し、切り出し画像とマスクのみを生成
 """
 
 import argparse
+import json
 import os
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -266,6 +268,48 @@ def render_perspective_images(
     return processor.rig_config
 
 
+def save_rig_config_to_json(rig_config: pycolmap.RigConfig, output_path: Path):
+    """RigConfigをJSON形式で保存（後で使えるように）"""
+    rig_dict = {
+        "cameras": []
+    }
+    
+    for idx, cam in enumerate(rig_config.cameras):
+        cam_dict = {
+            "image_prefix": cam.image_prefix,
+            "ref_sensor": cam.ref_sensor,
+        }
+        
+        if cam.camera is not None:
+            # pycolmapのバージョンによって属性名が異なる対応
+            try:
+                model_name = cam.camera.model_name
+            except AttributeError:
+                try:
+                    model_name = cam.camera.model.name
+                except AttributeError:
+                    # model_idから名前を取得
+                    model_name = cam.camera.ModelName()
+            
+            cam_dict["camera"] = {
+                "model": model_name,
+                "width": cam.camera.width,
+                "height": cam.camera.height,
+                "params": cam.camera.params.tolist(),
+            }
+        
+        if cam.cam_from_rig is not None:
+            cam_dict["cam_from_rig_rotation"] = cam.cam_from_rig.rotation.quat.tolist()
+            cam_dict["cam_from_rig_translation"] = cam.cam_from_rig.translation.tolist()
+        
+        rig_dict["cameras"].append(cam_dict)
+    
+    with open(output_path, 'w') as f:
+        json.dump(rig_dict, f, indent=2)
+    
+    logging.info(f"Saved rig config to {output_path}")
+
+
 def run(args):
     pycolmap.set_random_seed(0)
 
@@ -276,12 +320,7 @@ def run(args):
     mask_dir.mkdir(exist_ok=True, parents=True)
 
     database_path = args.output_path / "database.db"
-    if database_path.exists():
-        database_path.unlink()
-
-    rec_path = args.output_path / "sparse"
-    rec_path.mkdir(exist_ok=True, parents=True)
-
+    
     # Search for input images.
     pano_image_dir = args.input_image_path
     pano_image_names = sorted(
@@ -291,6 +330,14 @@ def run(args):
     )
     logging.info(f"Found {len(pano_image_names)} images in {pano_image_dir}.")
 
+    # ========================================
+    # ステップ1: 画像切り出しとマスク生成
+    # ========================================
+    
+    logging.info("=" * 60)
+    logging.info("ステップ1: 画像切り出しとマスク生成")
+    logging.info("=" * 60)
+    
     rig_config = render_perspective_images(
         pano_image_names,
         pano_image_dir,
@@ -299,117 +346,137 @@ def run(args):
         PANO_RENDER_OPTIONS[args.pano_render_type],
     )
 
-    pycolmap.extract_features(
-        database_path,
-        image_dir,
-        reader_options={"mask_path": str(mask_dir)},
-        camera_mode=pycolmap.CameraMode.PER_FOLDER,
-    )
+    # RigConfigをJSON形式で保存
+    rig_config_path = args.output_path / "rig_config.json"
+    save_rig_config_to_json(rig_config, rig_config_path)
 
-    # Database操作を修正
-    db = pycolmap.Database(str(database_path))
-    try:
-        pycolmap.apply_rig_config([rig_config], db)
-    finally:
-        db.close()
-
-    # マッチング処理
-    if args.matcher == "sequential":
-        pycolmap.match_sequential(
-            str(database_path),
-            matching_options=pycolmap.SequentialMatchingOptions(
-                overlap=10,
-                quadratic_overlap=True,
-                expand_rig_images=True,
-                loop_detection=True,
-                loop_detection_period=10,
-            )
-        )
-        # 追加: Exhaustive Matchingでより多くのマッチを取得
-        logging.info("Running exhaustive matching for better coverage...")
-        pycolmap.match_exhaustive(
-            str(database_path),
-            sift_options=pycolmap.SiftMatchingOptions(
-                max_num_matches=32768,
-                max_ratio=0.8,
-            )
-        )
-    elif args.matcher == "exhaustive":
-        pycolmap.match_exhaustive(
-            str(database_path),
-            sift_options=pycolmap.SiftMatchingOptions(
-                max_num_matches=32768,
-                max_ratio=0.8,
-            )
-        )
-    elif args.matcher == "vocabtree":
-        matching_options = pycolmap.SpatialMatchingOptions()
-        pycolmap.match_vocabtree(
-            str(database_path), 
-            matching_options=matching_options
-        )
-    elif args.matcher == "spatial":
-        matching_options = pycolmap.SpatialMatchingOptions()
-        pycolmap.match_spatial(
-            str(database_path), 
-            matching_options=matching_options
-        )
-    else:
-        logging.fatal(f"Unknown matcher: {args.matcher}")
-    # IncrementalPipelineOptionsをより寛容に設定
-    opts = pycolmap.IncrementalPipelineOptions()
-    opts.ba_refine_sensor_from_rig = False
-    opts.ba_refine_focal_length = False
-    opts.ba_refine_principal_point = False
-    opts.ba_refine_extra_params = False
-
-    # マッパーオプションの調整（より寛容に）
-    # 注意: 属性名はバージョンによって異なる可能性があります
-    try:
-        opts.min_num_matches = 10
-        opts.mapper.init_min_num_inliers = 30
-        opts.mapper.init_min_tri_angle = 3.0
-        opts.mapper.abs_pose_min_num_inliers = 10
-        opts.mapper.abs_pose_min_inlier_ratio = 0.15
-    except AttributeError:
-        # 古いバージョンの場合は設定をスキップ
-        logging.warning("Could not set some mapper options (version compatibility)")
-    pass
-
-    logging.info("Starting incremental mapping...")
-    recs = pycolmap.incremental_mapping(
-        str(database_path), str(image_dir), str(rec_path), opts
-    )
-
+    logging.info("✓ 画像切り出しとマスク生成が完了")
     
-    if len(recs) == 0:
-        logging.warning("No reconstruction created. Checking database for matches...")
-        # デバッグ: マッチング結果を確認
-        db = pycolmap.Database(str(database_path))
-        try:
-            num_images = db.num_images()
-            logging.info(f"Database contains {num_images} images")
-            # Note: read_all_matches() may not be available in all versions
-            # If it fails, just skip the debug output
-        finally:
-            db.close()
+    # ========================================
+    # ステップ2: 特徴抽出
+    # ========================================
+    
+    rig_config_applied = False  # Rig Config適用状況を追跡
+    
+    if not args.skip_feature_extraction:
+        logging.info("")
+        logging.info("=" * 60)
+        logging.info("ステップ2: 特徴抽出")
+        logging.info("=" * 60)
+        
+        # データベースが既に存在する場合は削除
+        if database_path.exists():
+            logging.info(f"既存のデータベースを削除: {database_path}")
+            database_path.unlink()
+        
+        # 特徴抽出（動作するバージョンのAPIを使用）
+        pycolmap.extract_features(
+            database_path,
+            image_dir,
+            reader_options={"mask_path": mask_dir},
+            camera_mode=pycolmap.CameraMode.PER_FOLDER,
+        )
+        
+        logging.info("✓ 特徴抽出完了")
+        
+        # ========================================
+        # ステップ3: Rig Config適用
+        # ========================================
+        
+        if not args.skip_rig_config:
+            logging.info("")
+            logging.info("=" * 60)
+            logging.info("ステップ3: Rig Config適用")
+            logging.info("=" * 60)
+            
+            # 動作するバージョンのAPIを使用
+            try:
+                with pycolmap.Database.open(database_path) as db:
+                    pycolmap.apply_rig_config([rig_config], db)
+                logging.info("✓ Rig設定を適用しました")
+                rig_config_applied = True
+            except Exception as e:
+                logging.error(f"Rig Config適用エラー: {e}")
+                logging.warning("Rig Configの適用に失敗しましたが、処理を続行します")
+                logging.warning("マスクによる重複防止は有効です")
+    
+    # rig_config_applied変数を設定（skip_rig_configの場合）
+    if args.skip_rig_config:
+        rig_config_applied = False
+    
+    # ========================================
+    # 完了メッセージ
+    # ========================================
+    
+    logging.info("")
+    logging.info("=" * 60)
+    logging.info("処理完了")
+    logging.info("=" * 60)
+    logging.info(f"切り出し画像: {image_dir}")
+    logging.info(f"マスク: {mask_dir}")
+    logging.info(f"Rig設定: {rig_config_path}")
+    
+    if not args.skip_feature_extraction:
+        logging.info(f"データベース: {database_path}")
+        if rig_config_applied:
+            logging.info("Rig Config: 適用済み")
+        else:
+            logging.info("Rig Config: 未適用（Exhaustive Matcher推奨）")
+        logging.info("")
+        logging.info("次のステップ:")
+        logging.info("1. DSLR写真を追加する場合:")
+        logging.info(f"   cp dslr_photos/* {image_dir}/")
+        logging.info(f"   colmap feature_extractor --database_path {database_path} --image_path {image_dir}")
+        logging.info("")
+        if rig_config_applied:
+            logging.info("2. マッチング（Sequential推奨）:")
+            logging.info(f"   colmap sequential_matcher --database_path {database_path}")
+        else:
+            logging.info("2. マッチング（Exhaustive必須 - Rig Config未適用）:")
+            logging.info(f"   colmap exhaustive_matcher --database_path {database_path}")
+        logging.info("")
+        logging.info("3. マッピング:")
+        logging.info(f"   colmap mapper --database_path {database_path} --image_path {image_dir} --output_path sparse/")
     else:
-        for idx, rec in recs.items():
-            logging.info(f"#{idx} {rec.summary()}")
+        logging.info("")
+        logging.info("次のステップ:")
+        logging.info("1. DSLR写真を追加する場合:")
+        logging.info(f"   cp dslr_photos/* {image_dir}/")
+        logging.info("")
+        logging.info("2. COLMAPで特徴抽出:")
+        logging.info(f"   colmap feature_extractor \\")
+        logging.info(f"     --database_path {database_path} \\")
+        logging.info(f"     --image_path {image_dir} \\")
+        logging.info(f"     --ImageReader.mask_path {mask_dir} \\")
+        logging.info(f"     --ImageReader.single_camera_per_folder 1")
+        logging.info("")
+        logging.info("3. マッチングとマッピング:")
+        logging.info("   colmap sequential_matcher ...")
+        logging.info("   colmap mapper ...")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input_image_path", type=Path, required=True)
-    parser.add_argument("--output_path", type=Path, required=True)
-    parser.add_argument(
-        "--matcher",
-        default="sequential",
-        choices=["sequential", "exhaustive", "vocabtree", "spatial"],
+    parser = argparse.ArgumentParser(
+        description="panorama_sfm.pyベースの画像切り出し・特徴抽出・Rig Config適用スクリプト"
     )
+    parser.add_argument("--input_image_path", type=Path, required=True,
+                        help="360度画像の入力ディレクトリ")
+    parser.add_argument("--output_path", type=Path, required=True,
+                        help="出力ディレクトリ")
     parser.add_argument(
         "--pano_render_type",
         default="overlapping",
         choices=list(PANO_RENDER_OPTIONS.keys()),
+        help="切り出しタイプ（デフォルト: overlapping = 4方向×3ピッチ=12視点）"
+    )
+    parser.add_argument(
+        "--skip_feature_extraction",
+        action="store_true",
+        help="特徴抽出をスキップ（画像切り出しとマスク生成のみ）"
+    )
+    parser.add_argument(
+        "--skip_rig_config",
+        action="store_true",
+        help="Rig Config適用をスキップ"
     )
     run(parser.parse_args())

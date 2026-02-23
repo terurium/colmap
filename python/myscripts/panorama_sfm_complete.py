@@ -1,5 +1,6 @@
 """
 An example for running incremental SfM on 360 spherical panorama images.
+【完全版】: 画像切り出し→特徴抽出→Rig Config→マッチング→マッピングまで全自動
 """
 
 import argparse
@@ -276,126 +277,93 @@ def run(args):
     mask_dir.mkdir(exist_ok=True, parents=True)
 
     database_path = args.output_path / "database.db"
-    if database_path.exists():
-        database_path.unlink()
+
+    # マッチングから再開する場合は、前処理をスキップ
+    if args.resume_from_matching:
+        if not database_path.exists():
+            raise FileNotFoundError(
+                f"Database not found at {database_path}. "
+                "Cannot resume from matching without existing database."
+            )
+        logging.info("Resuming from matching step using existing database.")
+    else:
+        # 既存のデータベースを削除して最初から実行
+        if database_path.exists():
+            database_path.unlink()
+
+        rec_path = args.output_path / "sparse"
+        rec_path.mkdir(exist_ok=True, parents=True)
+
+        # Search for input images.
+        pano_image_dir = args.input_image_path
+        pano_image_names = sorted(
+            p.relative_to(pano_image_dir).as_posix()
+            for p in pano_image_dir.rglob("*")
+            if not p.is_dir()
+        )
+        logging.info(f"Found {len(pano_image_names)} images in {pano_image_dir}.")
+
+        rig_config = render_perspective_images(
+            pano_image_names,
+            pano_image_dir,
+            image_dir,
+            mask_dir,
+            PANO_RENDER_OPTIONS[args.pano_render_type],
+        )
+
+        pycolmap.extract_features(
+            database_path,
+            image_dir,
+            reader_options={"mask_path": mask_dir},
+            camera_mode=pycolmap.CameraMode.PER_FOLDER,
+        )
+
+        with pycolmap.Database.open(database_path) as db:
+            pycolmap.apply_rig_config([rig_config], db)
 
     rec_path = args.output_path / "sparse"
     rec_path.mkdir(exist_ok=True, parents=True)
 
-    # Search for input images.
-    pano_image_dir = args.input_image_path
-    pano_image_names = sorted(
-        p.relative_to(pano_image_dir).as_posix()
-        for p in pano_image_dir.rglob("*")
-        if not p.is_dir()
-    )
-    logging.info(f"Found {len(pano_image_names)} images in {pano_image_dir}.")
-
-    rig_config = render_perspective_images(
-        pano_image_names,
-        pano_image_dir,
-        image_dir,
-        mask_dir,
-        PANO_RENDER_OPTIONS[args.pano_render_type],
-    )
-
-    pycolmap.extract_features(
-        database_path,
-        image_dir,
-        reader_options={"mask_path": str(mask_dir)},
-        camera_mode=pycolmap.CameraMode.PER_FOLDER,
-    )
-
-    # Database操作を修正
-    db = pycolmap.Database(str(database_path))
-    try:
-        pycolmap.apply_rig_config([rig_config], db)
-    finally:
-        db.close()
-
-    # マッチング処理
+    matching_options = pycolmap.FeatureMatchingOptions()
+    # We have perfect sensor_from_rig poses (except for potential stitching
+    # artifacts by the spherical image provider), so we can perform geometric
+    # verification using rig constraints.
+    matching_options.rig_verification = True
+    # The images within a frame do not have overlap due to the provided masks.
+    matching_options.skip_image_pairs_in_same_frame = True
     if args.matcher == "sequential":
         pycolmap.match_sequential(
-            str(database_path),
-            matching_options=pycolmap.SequentialMatchingOptions(
-                overlap=10,
-                quadratic_overlap=True,
-                expand_rig_images=True,
+            database_path,
+            pairing_options=pycolmap.SequentialPairingOptions(
                 loop_detection=True,
-                loop_detection_period=10,
-            )
-        )
-        # 追加: Exhaustive Matchingでより多くのマッチを取得
-        logging.info("Running exhaustive matching for better coverage...")
-        pycolmap.match_exhaustive(
-            str(database_path),
-            sift_options=pycolmap.SiftMatchingOptions(
-                max_num_matches=32768,
-                max_ratio=0.8,
-            )
+                vocab_tree_path=Path.home() / ".cache/colmap/vocab_tree_faiss_flickr100K_words256K.bin"
+            ),
+            matching_options=matching_options,
         )
     elif args.matcher == "exhaustive":
         pycolmap.match_exhaustive(
-            str(database_path),
-            sift_options=pycolmap.SiftMatchingOptions(
-                max_num_matches=32768,
-                max_ratio=0.8,
-            )
+            database_path, matching_options=matching_options
         )
     elif args.matcher == "vocabtree":
-        matching_options = pycolmap.SpatialMatchingOptions()
         pycolmap.match_vocabtree(
-            str(database_path), 
-            matching_options=matching_options
+            database_path, matching_options=matching_options
         )
     elif args.matcher == "spatial":
-        matching_options = pycolmap.SpatialMatchingOptions()
-        pycolmap.match_spatial(
-            str(database_path), 
-            matching_options=matching_options
-        )
+        pycolmap.match_spatial(database_path, matching_options=matching_options)
     else:
         logging.fatal(f"Unknown matcher: {args.matcher}")
-    # IncrementalPipelineOptionsをより寛容に設定
-    opts = pycolmap.IncrementalPipelineOptions()
-    opts.ba_refine_sensor_from_rig = False
-    opts.ba_refine_focal_length = False
-    opts.ba_refine_principal_point = False
-    opts.ba_refine_extra_params = False
 
-    # マッパーオプションの調整（より寛容に）
-    # 注意: 属性名はバージョンによって異なる可能性があります
-    try:
-        opts.min_num_matches = 10
-        opts.mapper.init_min_num_inliers = 30
-        opts.mapper.init_min_tri_angle = 3.0
-        opts.mapper.abs_pose_min_num_inliers = 10
-        opts.mapper.abs_pose_min_inlier_ratio = 0.15
-    except AttributeError:
-        # 古いバージョンの場合は設定をスキップ
-        logging.warning("Could not set some mapper options (version compatibility)")
-    pass
-
-    logging.info("Starting incremental mapping...")
-    recs = pycolmap.incremental_mapping(
-        str(database_path), str(image_dir), str(rec_path), opts
+    opts = pycolmap.IncrementalPipelineOptions(
+        ba_refine_sensor_from_rig=False,
+        ba_refine_focal_length=False,
+        ba_refine_principal_point=False,
+        ba_refine_extra_params=False,
     )
-
-    
-    if len(recs) == 0:
-        logging.warning("No reconstruction created. Checking database for matches...")
-        # デバッグ: マッチング結果を確認
-        db = pycolmap.Database(str(database_path))
-        try:
-            num_images = db.num_images()
-            logging.info(f"Database contains {num_images} images")
-            # Note: read_all_matches() may not be available in all versions
-            # If it fails, just skip the debug output
-        finally:
-            db.close()
-    else:
-        for idx, rec in recs.items():
-            logging.info(f"#{idx} {rec.summary()}")
+    recs = pycolmap.incremental_mapping(
+        database_path, image_dir, rec_path, opts
+    )
+    for idx, rec in recs.items():
+        logging.info(f"#{idx} {rec.summary()}")
 
 
 if __name__ == "__main__":
@@ -411,5 +379,10 @@ if __name__ == "__main__":
         "--pano_render_type",
         default="overlapping",
         choices=list(PANO_RENDER_OPTIONS.keys()),
+    )
+    parser.add_argument(
+        "--resume-from-matching",
+        action="store_true",
+        help="Resume from feature matching step using existing database (skip image rendering and feature extraction)",
     )
     run(parser.parse_args())

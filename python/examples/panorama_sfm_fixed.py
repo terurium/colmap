@@ -306,8 +306,9 @@ def run(args):
         camera_mode=pycolmap.CameraMode.PER_FOLDER,
     )
 
-    # Database操作を修正
-    db = pycolmap.Database(str(database_path))
+    # Database操作を修正（pycolmap 3.13.0対応）
+    db = pycolmap.Database()
+    db.open(database_path)
     try:
         pycolmap.apply_rig_config([rig_config], db)
     finally:
@@ -316,7 +317,7 @@ def run(args):
     # マッチング処理
     if args.matcher == "sequential":
         pycolmap.match_sequential(
-            str(database_path),
+            database_path,
             matching_options=pycolmap.SequentialMatchingOptions(
                 overlap=10,
                 quadratic_overlap=True,
@@ -328,7 +329,7 @@ def run(args):
         # 追加: Exhaustive Matchingでより多くのマッチを取得
         logging.info("Running exhaustive matching for better coverage...")
         pycolmap.match_exhaustive(
-            str(database_path),
+            database_path,
             sift_options=pycolmap.SiftMatchingOptions(
                 max_num_matches=32768,
                 max_ratio=0.8,
@@ -336,7 +337,7 @@ def run(args):
         )
     elif args.matcher == "exhaustive":
         pycolmap.match_exhaustive(
-            str(database_path),
+            database_path,
             sift_options=pycolmap.SiftMatchingOptions(
                 max_num_matches=32768,
                 max_ratio=0.8,
@@ -345,13 +346,13 @@ def run(args):
     elif args.matcher == "vocabtree":
         matching_options = pycolmap.SpatialMatchingOptions()
         pycolmap.match_vocabtree(
-            str(database_path), 
+            database_path, 
             matching_options=matching_options
         )
     elif args.matcher == "spatial":
         matching_options = pycolmap.SpatialMatchingOptions()
         pycolmap.match_spatial(
-            str(database_path), 
+            database_path, 
             matching_options=matching_options
         )
     else:
@@ -378,14 +379,15 @@ def run(args):
 
     logging.info("Starting incremental mapping...")
     recs = pycolmap.incremental_mapping(
-        str(database_path), str(image_dir), str(rec_path), opts
+        database_path, str(image_dir), str(rec_path), opts
     )
 
     
     if len(recs) == 0:
         logging.warning("No reconstruction created. Checking database for matches...")
         # デバッグ: マッチング結果を確認
-        db = pycolmap.Database(str(database_path))
+        db = pycolmap.Database()
+        db.open(database_path)
         try:
             num_images = db.num_images()
             logging.info(f"Database contains {num_images} images")
